@@ -16,7 +16,9 @@ zctest001.py —— 料号申请自动化采集（Playwright 同步版）
     5. Excel 写回改为直接调用（原 asyncio.to_thread 只是把阻塞调用挪出
        事件循环，同步版没有事件循环要保护，直接写即可）；COM 在主线程
        初始化/释放。
-    6. 其余采集、清洗、统计逻辑保持不变。
+    6. 搜索后等待列表内容真正刷新再读取，修复把搜索前的待办列表
+       当成搜索结果的问题。
+    7. 其余采集、清洗、统计逻辑保持不变。
 
 依赖安装：
     pip install playwright pywin32
@@ -63,6 +65,9 @@ PAGE_TIMEOUT_MS = 30_000        # 常规操作超时
 POPUP_TIMEOUT_MS = 5_000        # 登录提示浮层等可选项
 DETAIL_TIMEOUT_MS = 20_000      # 详情页字段渲染
 NEW_TAB_TIMEOUT_MS = 15_000     # 点击行后等待详情出现
+
+# 待办列表中每行第 2 列（请求标题列），读取列表统一用它
+ROW_CELL_SELECTOR = "tbody.ant-table-tbody tr.ant-table-row td:nth-child(2)"
 
 # 详情页明细表字段 -> 候选 CSS 选择器列表（按顺序尝试，取第一个非空结果）。
 # 分类列原来只写了 `a`，当分类为空或不是链接渲染时匹配数为 0，会被列数校验
@@ -229,20 +234,31 @@ def search_pending_requests(page) -> None:
     if search_btn.count() == 0:
         search_btn = page.get_by_role(
             "button", name=re.compile(r"^\s*搜\s*索\s*$"))
+    # 点击搜索前先记录当前列表内容：搜索结果出来之前表格里仍是旧数据，
+    # 原来的"等表格存在/网络空闲"会立即满足，导致把搜索前的待办列表当成结果
+    # （曾出现实际 2 条待处理、却读到 10 条的情况）。
+    before = [t.strip() for t in page.locator(ROW_CELL_SELECTOR).all_text_contents()]
+
     search_btn.first.click()
 
-    # 等数据刷新：先等网络空闲，再等表格行或空表占位出现
-    try:
-        page.wait_for_load_state("networkidle", timeout=DETAIL_TIMEOUT_MS)
-    except PWTimeoutError:
-        log.warning("搜索后 networkidle 超时，继续尝试读取表格")
-    try:
-        page.wait_for_selector(
-            "tbody.ant-table-tbody tr.ant-table-row, .ant-table-placeholder",
-            timeout=DETAIL_TIMEOUT_MS,
-        )
-    except PWTimeoutError:
-        log.warning("搜索结果表格未出现")
+    deadline = time.monotonic() + DETAIL_TIMEOUT_MS / 1000
+    while True:
+        # 等表格 loading 结束（没有 loading 时立即返回）
+        try:
+            page.wait_for_selector(".ant-spin-spinning", state="hidden", timeout=1000)
+        except PWTimeoutError:
+            pass
+        current = [t.strip() for t in page.locator(ROW_CELL_SELECTOR).all_text_contents()]
+        empty = page.locator(".ant-table-placeholder").count() > 0
+        # 内容确实变化（或确认为空表）才算刷新完成；
+        # 读到空列表但无占位符说明还在渲染中，继续等。
+        if current != before and (current or empty):
+            log.info("搜索结果已刷新，共 %d 条", len(current))
+            return
+        if time.monotonic() >= deadline:
+            log.warning("等待搜索结果刷新超时，按当前列表继续（结果可能与搜索前一致）")
+            return
+        page.wait_for_timeout(300)
 
 
 def open_detail(context, page, cell) -> tuple[object, bool]:
@@ -422,8 +438,7 @@ def run(username: str, password: str) -> int:
             login(page, username, password)
             search_pending_requests(page)
 
-            cells = page.locator(
-                "tbody.ant-table-tbody tr.ant-table-row td:nth-child(2)")
+            cells = page.locator(ROW_CELL_SELECTOR)
             count = cells.count()
             log.info("待处理申请共 %d 条", count)
 
