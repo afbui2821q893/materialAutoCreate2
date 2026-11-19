@@ -21,6 +21,8 @@ zctest002.py —— 料号申请自动填号（Playwright 同步重构版，重�
       行元素只抓一次容易失效、搜索按钮/高级搜索入口多元素命中
     - 明细行数先用网络空闲 + 输入框出现双重等待确认，再一次性填入，
       填入数量与料号清单做匹配校验，避免错位脏数据
+    - 搜索后等待列表内容真正刷新再读取，修复把搜索前的待办列表
+      当成搜索结果的问题
     - 全程 logging 输出统计，料号剩余/不足都会显式告警
     - 结束不再调用 browser.close()：保留会话与已填写页面，等待用户手动关闭
 
@@ -125,20 +127,31 @@ def search_pending_requests(page) -> None:
     if search_btn.count() == 0:
         search_btn = page.get_by_role(
             "button", name=re.compile(r"^\s*搜\s*索\s*$"))
+    # 点击搜索前先记录当前列表内容：搜索结果出来之前表格里仍是旧数据，
+    # 原来的“等表格存在/网络空闲”会立即满足，导致把搜索前的待办列表当成结果
+    # （曾出现实际 2 条待处理、却读到 10 条的情况）。
+    before = [t.strip() for t in page.locator(ROW_CELL_SELECTOR).all_text_contents()]
+
     search_btn.first.click()
 
-    # 等数据刷新：先等网络空闲，再等表格行或空表占位出现
-    try:
-        page.wait_for_load_state("networkidle", timeout=DETAIL_TIMEOUT_MS)
-    except PWTimeoutError:
-        log.warning("搜索后 networkidle 超时，继续尝试读取表格")
-    try:
-        page.wait_for_selector(
-            "tbody.ant-table-tbody tr.ant-table-row, .ant-table-placeholder",
-            timeout=DETAIL_TIMEOUT_MS,
-        )
-    except PWTimeoutError:
-        log.warning("搜索结果表格未出现")
+    deadline = time.monotonic() + DETAIL_TIMEOUT_MS / 1000
+    while True:
+        # 等表格 loading 结束（没有 loading 时立即返回）
+        try:
+            page.wait_for_selector(".ant-spin-spinning", state="hidden", timeout=1000)
+        except PWTimeoutError:
+            pass
+        current = [t.strip() for t in page.locator(ROW_CELL_SELECTOR).all_text_contents()]
+        empty = page.locator(".ant-table-placeholder").count() > 0
+        # 内容确实变化（或确认为空表）才算刷新完成；
+        # 读到空列表但无占位符说明还在渲染中，继续等。
+        if current != before and (current or empty):
+            log.info("搜索结果已刷新，共 %d 条", len(current))
+            return
+        if time.monotonic() >= deadline:
+            log.warning("等待搜索结果刷新超时，按当前列表继续（结果可能与搜索前一致）")
+            return
+        page.wait_for_timeout(300)
 
 
 def open_detail(context, page, cell) -> tuple[object, bool]:
