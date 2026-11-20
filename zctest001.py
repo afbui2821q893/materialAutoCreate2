@@ -10,7 +10,8 @@ zctest001.py —— 料号申请自动化采集（Playwright 同步版）
        该正则是“包含匹配”，会同时命中两个「高级搜索」按钮，触发
        strict mode violation。这里锚定整名并限定主按钮 ant-btn-primary。
     3. 详情页解析容错：字段整列匹配不到（如分类/来源码未填）时按空值补齐，
-       不再因列数为 0 被误判为“字段列数不一致”而丢弃整单。
+       不再因列数为 0 被误判为“字段列数不一致”而丢弃整单；分类/来源码等
+       字段由前端异步渲染，读到整列空时短时重读，避免偶发读空。
     4. 详情页打开方式兼容：优先按新标签页处理，若 OA 在当前标签页内跳转，
        解析完后自动返回列表继续下一条。
     5. Excel 写回改为直接调用（原 asyncio.to_thread 只是把阻塞调用挪出
@@ -80,7 +81,10 @@ DETAIL_FIELDS = {
     "specification":  ("td.detail_1_3_5.etype_3 > div > span > span",),
     "brand":          ("td.detail_1_3_6.etype_3 > div > span > span",),
     "unit":           ("td.detail_1_3_7.etype_3 > div > span > span",),
-    "source_code":    ("td.detail_1_3_8.etype_3 > div > span > span.child-item.wdb",),
+    "source_code":    ("td.detail_1_3_8.etype_3 > div > span > span.child-item.wdb",
+                       "td.detail_1_3_8.etype_3 > div > span > span.child-item",
+                       "td.detail_1_3_8.etype_3 > div > span > span",
+                       "td.detail_1_3_8.etype_3"),
     "weight":         ("td.detail_1_3_9.etype_3 > div > span > span",),
     "material":       ("td.detail_1_3_10.etype_3 > div > span > span",),
     "remark":         ("td.detail_1_3_11.etype_3 > div > span > span",),
@@ -88,6 +92,11 @@ DETAIL_FIELDS = {
 }
 # 有附件则整单跳过（对应原 field11036 附件字段）
 ATTACHMENT_SELECTOR = "div.field11036_swapDiv .wea-upload-list-item-filesize"
+
+# 详情页里必须读到值的字段：分类/来源码等由前端异步渲染，名称列出现时
+# 可能还没填值，读到整列为空时短时重读（其余字段允许为空，不触发重读）
+REQUIRED_FIELDS = ("classification", "specification", "brand", "unit", "source_code")
+FIELD_RETRY_TIMEOUT_MS = 6_000   # 异步字段重读的最长等待
 
 # 单位映射表：页面单位值（为其子串）-> 表尾 [CODE] 中的标准单位码
 UNIT_LIST = [
@@ -345,17 +354,43 @@ def parse_detail(detail) -> list[MaterialRow] | None:
             fallback = fallback or texts
         return fallback if fallback is not None else []
 
-    values: dict[str, list[str]] = {
-        "name": pick(DETAIL_FIELDS["name"], 0)}     # 名称列先确定数据行数
-    expected = len(values["name"])
+    def read_all() -> tuple[dict[str, list[str]], list[str]]:
+        """读一遍所有字段；返回 (字段值, 还没渲染出值的必填字段)。"""
+        values = {"name": pick(DETAIL_FIELDS["name"], 0)}   # 名称列先确定数据行数
+        expected_ = len(values["name"])
+        if expected_ == 0:
+            return values, []
+        not_ready = []
+        for key, selectors in DETAIL_FIELDS.items():
+            if key == "name":
+                continue
+            texts = pick(selectors, expected_)
+            values[key] = texts
+            if key in REQUIRED_FIELDS and (
+                    len(texts) != expected_ or all(not t.strip() for t in texts)):
+                not_ready.append(key)
+        return values, not_ready
+
+    # 分类/来源码等是前端异步渲染的字典字段：名称列出现时它们的值可能还没填上，
+    # 直接读会整列为空（曾出现来源码整列匹配不到、分类整列空）。这里短时重读。
+    deadline = time.monotonic() + FIELD_RETRY_TIMEOUT_MS / 1000
+    while True:
+        values, not_ready = read_all()
+        expected = len(values["name"])
+        if expected == 0 or not not_ready or time.monotonic() >= deadline:
+            break
+        detail.wait_for_timeout(300)
+    if not_ready:
+        log.warning("  字段 %s 等待后仍为空，按空值写入", ", ".join(not_ready))
+
     if expected == 0:
         log.info("  明细表无数据行，跳过")
         return []
 
-    for key, selectors in DETAIL_FIELDS.items():
+    for key in DETAIL_FIELDS:
         if key == "name":
             continue
-        texts = pick(selectors, expected)
+        texts = values.get(key, [])
         if not texts:                # 整列为空（如分类未填）→ 按空串补齐，不整单丢弃
             log.warning("  字段 %s 未匹配到内容，按空值写入", key)
             texts = [""] * expected
