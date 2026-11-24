@@ -19,6 +19,7 @@ zctest002.py —— 料号申请自动填号（Playwright 同步重构版，重�
     - 修复原脚本问题：料号不足时直接 IndexError、附件/输入框未渲染完就读取、
       `clear()+send_keys` 的输入方式、窗口句柄靠下标取导致切错页、
       行元素只抓一次容易失效、搜索按钮/高级搜索入口多元素命中
+    - 填料号前先全选删除旧内容再写入，避免与页面已填值粘连
     - 明细行数先用网络空闲 + 输入框出现双重等待确认，再一次性填入，
       填入数量与料号清单做匹配校验，避免错位脏数据
     - 搜索后等待列表内容真正刷新再读取，修复把搜索前的待办列表
@@ -241,7 +242,13 @@ def fill_detail(detail, codes: list[str], cursor: int) -> tuple[int, str]:
             f"料号清单不足：本单需要 {count} 个，剩余 {len(codes) - cursor} 个")
 
     for i in range(count):
-        inputs.nth(i).fill(codes[cursor + i])   # fill 自带清空，替代 clear()+send_keys
+        box = inputs.nth(i)
+        # 泛微的自定义输入组件在已有值时会把 fill 当成“继续输入”，导致新料号
+        # 拼在旧值后面（曾出现两串料号粘连）。先聚焦并全选删除旧内容再写入。
+        box.click()
+        box.press("Control+A")
+        box.press("Delete")
+        box.fill(codes[cursor + i])
     log.info("  已填入 %d 个料号", count)
     return cursor + count, "filled"
 
