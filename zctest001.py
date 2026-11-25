@@ -181,15 +181,27 @@ def clean_text(text: str, space_replacement: str) -> str:
 
 
 def normalize_unit(unit: str) -> str:
-    """页面单位 -> 标准单位码；无法识别时保留原值并告警（原来是静默写 None）。"""
+    """页面单位 -> 标准单位码（只保留英文字母，且全部大写）。
+
+    映射表命中时取表尾的标准码（M2 这类带数字的标准码保留数字）；
+    未命中时从原值中提取英文并转大写，非英文字符一律丢弃，
+    如 "公斤" 这类映射表未收录且无英文的值会写成空串。
+    """
     unit = q2b_str(unit.strip())
     if unit in ("g", "G", "克"):
         return "G"
     for pattern in UNIT_LIST:
-        if unit in pattern:
-            return re.search(r"[A-Za-z]+", pattern).group()
-    log.warning("  单位无法识别: %r，按原值写入", unit)
-    return unit
+        # 页面值里的全角括号与映射表一致化后再比较（q2b 会把（）转成 ()）
+        if unit in q2b_str(pattern):
+            # 标准码本身可能含数字（如平方米 [M2]），需保留
+            return re.search(r"[A-Za-z0-9]+", pattern).group().upper()
+
+    letters = "".join(re.findall(r"[A-Za-z]+", unit))
+    if not letters:
+        log.warning("  单位无法识别: %r，不含英文字符，写入空值", unit)
+        return ""
+    log.debug("  单位映射表未收录: %r，仅保留英文并大写: %s", unit, letters.upper())
+    return letters.upper()
 
 
 def normalize_source_code(source: str) -> str:
